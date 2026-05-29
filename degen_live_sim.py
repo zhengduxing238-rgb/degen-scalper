@@ -392,9 +392,186 @@ def main():
         log(f"💥 {e}")
         import traceback; traceback.print_exc()
 
+# ═══════════════════ 回测 ═══════════════════
+def run_backtest(hours=24):
+    """用本地 DuckDB 1m K线回测"""
+    try:
+        import duckdb
+    except ImportError:
+        print("需要 duckdb: pip install duckdb")
+        return
+    
+    db = os.path.expanduser("~/.hermes/crypto_klines.duckdb")
+    if not os.path.exists(db):
+        print(f"未找到 {db}，请先采集 1m K线数据")
+        return
+    
+    d = duckdb.connect(db, read_only=True)
+    max_ts = d.execute("SELECT MAX(open_time) FROM klines WHERE tf='1m'").fetchone()[0]
+    min_ts = max_ts - hours*3600*1000
+    
+    symbols = [r[0] for r in d.execute(f"""
+        SELECT DISTINCT symbol FROM klines 
+        WHERE tf='1m' AND open_time>={min_ts}
+        GROUP BY symbol HAVING COUNT(*)>=100
+    """).fetchall()]
+    print(f"回测: {len(symbols)}币种 × {hours}h ({datetime.fromtimestamp(min_ts/1000)} ~ {datetime.fromtimestamp(max_ts/1000)})")
+    
+    # 加载数据
+    data = {}
+    for sym in symbols:
+        df = d.execute(f"""
+            SELECT open_time,open,high,low,close,volume
+            FROM klines WHERE tf='1m' AND symbol=? AND open_time>={min_ts}
+            ORDER BY open_time
+        """, [sym]).fetchdf()
+        if len(df) >= 60:
+            data[sym] = df.reset_index(drop=True)
+    d.close()
+    print(f"有效: {len(data)}币种")
+    
+    # 模拟
+    all_ts = sorted(set().union(*[set(df['open_time']) for df in data.values()]))
+    balance = BALANCE
+    pos = None  # {symbol, direction, entry, sl, tp, ts, peak}
+    trades = []
+    cooldowns = {}
+    
+    # 简化版 analyze_backtest (跳过订单簿/吃单)
+    def analyze_bt(sym, idx):
+        df = data[sym]
+        if idx < 30: return None
+        c = df.iloc[idx]['close']
+        roc1 = (c/df.iloc[idx-1]['close']-1)*100
+        roc5 = (c/df.iloc[idx-5]['close']-1)*100 if idx>=5 else 0
+        accel = roc1 - (df.iloc[idx-1]['close']/df.iloc[idx-2]['close']-1)*100
+        
+        v5 = df.iloc[max(0,idx-4):idx+1]['volume'].values
+        v20 = df.iloc[max(0,idx-19):idx+1]['volume'].values
+        vs = sum(v5)/len(v5) > sum(v20)/len(v20)*1.5
+        
+        bull = sum(1 for i in range(max(0,idx-4),idx+1) 
+                   if df.iloc[i]['close']>=df.iloc[i]['open'])/min(5,idx+1)
+        
+        score = abs(roc1*0.3 + roc5*0.2 + accel*0.2 + (1.5 if vs else 0) + (bull-0.5)*2)
+        direction = "LONG" if (roc1*0.3+roc5*0.2+accel*0.2) > 0 else "SHORT"
+        
+        # ATR
+        trs = []
+        for i in range(max(1,idx-20), idx+1):
+            h,l,pc = df.iloc[i]['high'],df.iloc[i]['low'],df.iloc[i-1]['close']
+            trs.append(max(h-l,abs(h-pc),abs(l-pc))/pc*100)
+        atr = sum(trs)/len(trs) if trs else 1.0
+        
+        return {"symbol":sym,"direction":direction,"score":score,"atr":atr} if score>=SIGNAL_MIN else None
+    
+    for ts in all_ts:
+        if pos:
+            sym = pos["symbol"]
+            df = data.get(sym)
+            if df is None: pos=None; continue
+            row = df[df['open_time']==ts]
+            if len(row)==0: continue
+            price = row.iloc[0]['close']
+            high = row.iloc[0]['high']
+            low = row.iloc[0]['low']
+            elapsed = (ts-pos["ts"])/60000
+            
+            d_ = pos["direction"]; entry = pos["entry"]
+            if d_=="LONG": pnl = (price-entry)/entry*100*LEVERAGE
+            else: pnl = (entry-price)/entry*100*LEVERAGE
+            
+            # 移动止盈
+            if pnl >= TRAIL_TRIGGER:
+                peak = max(pos.get("peak",entry), high) if d_=="LONG" else min(pos.get("peak",entry), low)
+                pos["peak"]=peak
+                if d_=="LONG":
+                    if low <= peak*(1-TRAIL_GAP/100):
+                        trades.append({"s":sym,"d":d_,"e":entry,"x":peak*(1-TRAIL_GAP/100),"r":"TRAIL"})
+                        balance += POSITION_USDT*pnl/100; pos=None; continue
+                else:
+                    if high >= peak*(1+TRAIL_GAP/100):
+                        trades.append({"s":sym,"d":d_,"e":entry,"x":peak*(1+TRAIL_GAP/100),"r":"TRAIL"})
+                        balance += POSITION_USDT*pnl/100; pos=None; continue
+            
+            # 固定SL/TP
+            closed = False
+            if d_=="LONG":
+                if high>=pos["tp"]:
+                    trades.append({"s":sym,"d":d_,"e":entry,"x":pos["tp"],"r":"TP"})
+                    balance+=POSITION_USDT*((pos["tp"]-entry)/entry*100*LEVERAGE)/100; closed=True
+                elif low<=pos["sl"]:
+                    trades.append({"s":sym,"d":d_,"e":entry,"x":pos["sl"],"r":"SL"})
+                    balance+=POSITION_USDT*((pos["sl"]-entry)/entry*100*LEVERAGE)/100; closed=True
+            else:
+                if low<=pos["tp"]:
+                    trades.append({"s":sym,"d":d_,"e":entry,"x":pos["tp"],"r":"TP"})
+                    balance+=POSITION_USDT*((entry-pos["tp"])/entry*100*LEVERAGE)/100; closed=True
+                elif high>=pos["sl"]:
+                    trades.append({"s":sym,"d":d_,"e":entry,"x":pos["sl"],"r":"SL"})
+                    balance+=POSITION_USDT*((entry-pos["sl"])/entry*100*LEVERAGE)/100; closed=True
+            
+            if closed: pos=None; continue
+            
+            if elapsed >= MAX_HOLD_MIN:
+                trades.append({"s":sym,"d":d_,"e":entry,"x":price,"r":"TO"})
+                balance += POSITION_USDT*pnl/100; pos=None; cooldowns[sym]=ts+COOLDOWN_TO*60000
+            continue
+        
+        # 扫描 (每30min)
+        if not hasattr(run_backtest,"last_scan"): run_backtest.last_scan=0
+        if ts-run_backtest.last_scan<30*60000: continue
+        run_backtest.last_scan=ts
+        
+        candidates = [s for s in data if ts>cooldowns.get(s,0)]
+        results = []
+        for sym in candidates:
+            idx = data[sym][data[sym]['open_time']==ts].index
+            if len(idx)==0: continue
+            r = analyze_bt(sym, idx[0])
+            if r: results.append(r)
+        
+        if not results: continue
+        results.sort(key=lambda r:-r["score"])
+        
+        best = results[0]; sym=best["symbol"]
+        row = data[sym][data[sym]['open_time']==ts].iloc[0]
+        price = row['close']
+        atr = best["atr"]
+        sl_pct = max(SL_MIN, min(atr*SL_ATR_MULT, SL_MAX))
+        tp_pct = max(TP_MIN, min(atr*TP_ATR_MULT, TP_MAX))
+        
+        d_ = best["direction"]
+        if d_=="LONG":
+            entry=price*(1+SLIPPAGE/100)
+            pos={"symbol":sym,"direction":d_,"entry":entry,
+                 "sl":entry*(1-sl_pct/100),"tp":entry*(1+tp_pct/100),"ts":ts,"peak":entry}
+        else:
+            entry=price*(1-SLIPPAGE/100)
+            pos={"symbol":sym,"direction":d_,"entry":entry,
+                 "sl":entry*(1+sl_pct/100),"tp":entry*(1-tp_pct/100),"ts":ts,"peak":entry}
+    
+    # 结果
+    wins = sum(1 for t in trades if t["r"] in ("TP","TRAIL") or (t["r"]=="TO" and 
+        (t["d"]=="LONG" and t["x"]>t["e"] or t["d"]=="SHORT" and t["x"]<t["e"])))
+    total = len(trades)
+    
+    print(f"\n{'='*50}")
+    print(f"回测结果 ({hours}h)")
+    print(f"${BALANCE:.2f} → ${balance:.2f} | {total}笔 | 胜率{wins/total*100:.0f}%" if total else "无交易")
+    
+    rs = {}
+    for t in trades: rs[t["r"]] = rs.get(t["r"],0)+1
+    print(f"出场: " + " ".join(f"{k}:{v}" for k,v in rs.items()))
+    
+    return {"balance":balance, "trades":total, "wins":wins}
+
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--backtest", action="store_true")
+    p.add_argument("--backtest", type=int, nargs="?", const=24, help="回测小时数(默认24)")
     args = p.parse_args()
-    main()
+    if args.backtest:
+        run_backtest(args.backtest)
+    else:
+        main()

@@ -1,0 +1,24 @@
+# Hermes agent state
+.hermes/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Strategy state/logs (local only)
+.degen_*
+*.db
+*.duckdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
